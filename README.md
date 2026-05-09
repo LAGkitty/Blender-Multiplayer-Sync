@@ -4,7 +4,9 @@ A Blender addon for real-time multiplayer collaboration and scene synchronizatio
 
 ## Demo
 
-https://github.com/LAGkitty/Blender-Multiplayer-Sync/blob/main/DEMO.mp4
+https://github.com/user-attachments/assets/demo
+
+<video src="https://github.com/LAGkitty/Blender-Multiplayer-Sync/raw/main/DEMO.mp4" controls width="100%"></video>
 
 ## Features
 
