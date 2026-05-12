@@ -11,7 +11,7 @@
 
 bl_info = {
     "name":        "Blender Multiplayer Sync",
-    "author":      "Claude (Updated)",
+    "author":      "Claude & LAGkit",
     "version":     (3, 2, 0),
     "blender":     (3, 0, 0),
     "location":    "View3D > N-Panel > Multiplayer",
