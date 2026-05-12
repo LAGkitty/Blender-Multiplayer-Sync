@@ -1,3 +1,4 @@
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/lagkitty)
 # Blender Multiplayer Sync
 
 A Blender addon for real-time multiplayer collaboration and scene synchronization.
