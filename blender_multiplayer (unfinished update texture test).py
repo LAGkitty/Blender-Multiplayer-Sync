@@ -4,20 +4,14 @@
 # ║  Proactive texture push · manifest map · node connect · keyframes      ║
 # ╚══════════════════════════════════════════════════════════════════════════╝
 #
-# KEY FIX in v4.2
-#   Textures were downloaded but never CONNECTED to the material node tree.
-#   _connect_image_to_material() now:
-#     • Finds or creates a TEX_IMAGE node in the material
-#     • Sets node.image to the loaded image datablock
-#     • Connects it to the first available color input
-#       (Principled BSDF Base Color  OR  Emission Color)
-#     • Handles the "Add Image as Plane" Emission setup specifically
-#   It is called:
-#     • inside _install_texture()   – right after saving the file
-#     • inside _apply_manifest()    – when repairing missing files
-#     • inside _state_to_obj()      – if the image is already in bpy.data.images
-#   Pending connections (image not yet downloaded) are stored in
-#   MP.pending_tex_connects and resolved on the next _install_texture() call.
+# KEY FIX in v4.2.1
+#   • _connect_image_to_material: pick the TEX_IMAGE that already feeds the
+#     Principled/Emission color socket (not the first TEX_IMAGE in the tree —
+#     that broke materials with normal/Roughness maps first in node order).
+#   • After wiring, nudge GPU + material tags so EEVEE viewport refreshes.
+#   • Sync tick: only redraw the active screen’s 3D views (not every area on
+#     every monitor); run a debounced manifest pass instead of a full folder
+#     scan after every single tex_push.
 #
 # MANIFEST  mp_textures.json  –  lives in your Texture Folder.
 # NETWORK   LAN out of box (TCP 19283).  Internet: port-forward or ZeroTier.
@@ -25,7 +19,7 @@
 bl_info = {
     "name":        "Blender Multiplayer Sync",
     "author":      "Claude & LAGkit",
-    "version":     (4, 2, 0),
+    "version":     (4, 2, 1),
     "blender":     (3, 0, 0),
     "location":    "View3D > N-Panel > Multiplayer",
     "description": "Real-time collaboration – objects, meshes, materials, textures, keyframes",
@@ -43,7 +37,8 @@ from bpy.types import Panel, Operator, PropertyGroup
 # ─────────────────────────────────────────────────────────────────────────────
 
 DEFAULT_PORT      = 19283
-SYNC_INTERVAL     = 0.05
+# ~30 Hz: enough for collaboration without hammering redraw / depsgraph.
+SYNC_INTERVAL     = 1.0 / 30.0
 LABEL_SIZE        = 14
 CURSOR_R          = 10
 CAM_R             = 7
@@ -96,6 +91,9 @@ class _MP:
     cached_region    = None
     cached_region_3d = None
 
+    # After tex_push, run _apply_manifest at most once per timer tick.
+    manifest_needs_pass = False
+
 MP = _MP()
 
 
@@ -103,14 +101,81 @@ MP = _MP()
 #  TEXTURE  NODE  CONNECTION  (the core fix)
 # ═════════════════════════════════════════════════════════════════════════════
 
+def _shader_color_socket(shader):
+    """Principled / Emission / generic BSDF color input used for albedo."""
+    for socket_name in ('Base Color', 'Color', 'Emission Color'):
+        if socket_name in shader.inputs:
+            return shader.inputs[socket_name]
+    return next(
+        (s for s in shader.inputs
+         if s.type in ('RGBA', 'VECTOR') and s.name.lower() != 'normal'),
+        None,
+    )
+
+
+def _tex_node_feeding_socket(nodes, color_input):
+    """If something is already wired into the color socket, prefer that TEX_IMAGE."""
+    if color_input is None:
+        return None
+    for lnk in color_input.links:
+        n = lnk.from_node
+        if n.type == 'TEX_IMAGE':
+            return n
+        # e.g. Separate Color between TEX_IMAGE and BSDF
+        stack = [n]
+        seen = set()
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            if cur.type == 'TEX_IMAGE':
+                return cur
+            for i in cur.inputs:
+                for l in i.links:
+                    stack.append(l.from_node)
+    return None
+
+
+def _pick_tex_image_node(nodes, color_input, img):
+    """
+    Never grab an arbitrary first TEX_IMAGE (normal/roughness maps break that).
+    Order: already feeding color socket → node using this image → first empty
+    TEX_IMAGE → create new.
+    """
+    hit = _tex_node_feeding_socket(nodes, color_input)
+    if hit is not None:
+        return hit
+    for n in nodes:
+        if n.type != 'TEX_IMAGE':
+            continue
+        ni = n.image
+        if ni is None:
+            return n
+        if ni == img or ni.name == img.name:
+            return n
+    return next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
+
+
+def _refresh_material_viewport(mat, img):
+    """EEVEE / viewport can stay grey until image + material GPU paths refresh."""
+    try:
+        mat.update_tag()
+    except Exception:
+        pass
+    try:
+        if hasattr(img, "gl_load"):
+            img.gl_load()
+        elif hasattr(img, "preview_ensure"):
+            img.preview_ensure()
+    except Exception:
+        pass
+
+
 def _connect_image_to_material(mat_name: str, img: "bpy.types.Image"):
     """
-    Find the material, locate or create a TEX_IMAGE node, assign img,
-    and wire it to whichever color socket is available:
-      • Principled BSDF  → Base Color
-      • Emission         → Color          (Add Image as Plane default)
-      • Any other shader → first Color/RGB input found
-    Safe to call multiple times (idempotent).
+    Wire `img` into the material's main color input using the best TEX_IMAGE node
+    (the one already driving Base Color when possible — avoids wrong map).
     """
     mat = bpy.data.materials.get(mat_name)
     if mat is None:
@@ -122,21 +187,6 @@ def _connect_image_to_material(mat_name: str, img: "bpy.types.Image"):
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
-    # ── Find or create TEX_IMAGE node ────────────────────────────────────────
-    tex_node = next((n for n in nodes if n.type == 'TEX_IMAGE'), None)
-    if tex_node is None:
-        tex_node = nodes.new('ShaderNodeTexImage')
-        tex_node.location = (-400, 300)
-
-    # Always assign / reassign the image
-    tex_node.image = img
-    try:
-        img.reload()
-    except Exception:
-        pass
-
-    # ── Find the target shader node and its color input ───────────────────────
-    # Priority: Principled → Emission → any BSDF → any node with Color input
     shader = (
         next((n for n in nodes if n.type == 'BSDF_PRINCIPLED'), None) or
         next((n for n in nodes if n.type == 'EMISSION'),         None) or
@@ -147,27 +197,26 @@ def _connect_image_to_material(mat_name: str, img: "bpy.types.Image"):
         print(f"[MP] _connect_image: no shader node found in '{mat_name}'")
         return
 
-    # Pick the right socket name
-    for socket_name in ('Base Color', 'Color', 'Emission Color'):
-        if socket_name in shader.inputs:
-            color_input = shader.inputs[socket_name]
-            break
-    else:
-        # Fall back: first socket that accepts color
-        color_input = next(
-            (s for s in shader.inputs
-             if s.type in ('RGBA', 'VECTOR') and s.name.lower() != 'normal'),
-            None,
-        )
-
+    color_input = _shader_color_socket(shader)
     if color_input is None:
         print(f"[MP] _connect_image: no suitable color input in '{mat_name}'")
         return
 
-    # Remove existing links on that socket then connect
+    tex_node = _pick_tex_image_node(nodes, color_input, img)
+    if tex_node is None:
+        tex_node = nodes.new('ShaderNodeTexImage')
+        tex_node.location = (shader.location.x - 400, shader.location.y + 180)
+
+    tex_node.image = img
+    try:
+        img.reload()
+    except Exception:
+        pass
+
     for lnk in list(color_input.links):
         links.remove(lnk)
     links.new(tex_node.outputs['Color'], color_input)
+    _refresh_material_viewport(mat, img)
     print(f"[MP] Connected '{img.name}' → '{mat_name}' ({color_input.name})")
 
 
@@ -504,8 +553,8 @@ def _install_texture(msg: dict, sync_folder: str):
     # 3. Resolve any previously queued pending connections
     _resolve_pending_connects()
 
-    # 4. Full manifest repair in case other images also became findable
-    _apply_manifest(sync_folder)
+    # 4. Debounced full manifest (avoid scanning entire scene per texture file)
+    MP.manifest_needs_pass = True
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -534,8 +583,14 @@ def _obj_to_state(obj, sync_mesh: bool = False) -> dict:
                 if bsdf:
                     col = bsdf.inputs["Base Color"].default_value
                     state["mat_color"] = [round(v, PREC) for v in col]
-                tex_node = next(
-                    (n for n in nodes if n.type == 'TEX_IMAGE' and n.image), None)
+                tex_node = None
+                if bsdf:
+                    bi = bsdf.inputs.get("Base Color")
+                    if bi:
+                        tex_node = _tex_node_feeding_socket(nodes, bi)
+                if tex_node is None:
+                    tex_node = next(
+                        (n for n in nodes if n.type == 'TEX_IMAGE' and n.image), None)
                 if tex_node:
                     img      = tex_node.image
                     filepath = bpy.path.abspath(img.filepath) if img.filepath else ""
@@ -985,6 +1040,10 @@ def _process_queue():
                 with MP.tex_lock: MP.sent_tex_hashes.add(p["hash"])
             print(f"[MP] sent {len(pushes)} textures to new peer.")
 
+    if MP.manifest_needs_pass and sync_folder:
+        MP.manifest_needs_pass = False
+        _apply_manifest(sync_folder)
+
 
 def _send_local_state():
     scene     = bpy.context.scene
@@ -1055,14 +1114,27 @@ def _send_local_state():
 #  SYNC TIMER
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _tag_view3d_redraw_light():
+    """Refresh peer overlays without iterating every 3D area on every screen."""
+    screen = getattr(bpy.context, "screen", None)
+    if screen:
+        for area in screen.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+        return
+    for scr in bpy.data.screens:
+        for area in scr.areas:
+            if area.type == "VIEW_3D":
+                area.tag_redraw()
+                return
+
+
 def _sync_tick():
     if not MP.connected:
         MP.timer_active = False; return None
     _process_queue()
     _send_local_state()
-    for screen in bpy.data.screens:
-        for area in screen.areas:
-            if area.type == "VIEW_3D": area.tag_redraw()
+    _tag_view3d_redraw_light()
     return SYNC_INTERVAL
 
 def _start_timer():
@@ -1179,6 +1251,7 @@ def _full_disconnect():
     with MP.baseline_lock: MP.obj_baseline.clear()
     with MP.tex_lock:    MP.sent_tex_hashes.clear()
     with MP.pending_lock: MP.pending_tex_connects.clear()
+    MP.manifest_needs_pass = False
     _stop_timer(); _stop_draw_handler()
     MP.status = "Disconnected"; MP.colour_idx = 0
 
@@ -1405,7 +1478,7 @@ _CLASSES = (
 def register():
     for cls in _CLASSES: bpy.utils.register_class(cls)
     bpy.types.Scene.mp_settings = bpy.props.PointerProperty(type=MPSettings)
-    print("[MP] Blender Multiplayer Sync v4.2 registered.")
+    print("[MP] Blender Multiplayer Sync v4.2.1 registered.")
 
 def unregister():
     _full_disconnect()
